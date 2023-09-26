@@ -52,7 +52,6 @@ class fhew_engine:
 
         # parameters for decomposition
         # we will use B-ary decomposition, i.e., cut digits by logB bits
-
         self.decomp_shift = self.logQ - self.logB * torch.arange(self.d,0,-1).view(self.d,1).to(self.device)
         self.mask = (1 << self.logB) - 1
 
@@ -77,13 +76,17 @@ class fhew_engine:
         self.ksk = None
 
     def create_secret_key(self):
+        """ Generate seceret key """
         return self.keygen(self.n)
 
-    """
-    @sk: secret key
-    returns brk and ksk as tuple
-    """
+    
     def create_bootstrap_key(self, sk):
+        """ Generate bootstrapping keys, and return a tuple brk (blind rotation keys)
+            and ksk (LWE key switching key)
+
+            Keyword arguments:
+            sk -- secret key
+        """
         skN = self.keygen(self.N)
 
         skNfft = self.negacyclic_fft(skN)
@@ -94,17 +97,28 @@ class fhew_engine:
         return brk, ksk
 
     def keygen(self, dim):
+        """ Generate uniform binary secret of size n.
+            Note: insecure PRNG is used.
+        """
         return torch.randint(2, size=(dim,), dtype=torch.int32, device=self.device)
 
     def errgen(self, dim):
+        """ Generate Gaussian noise of size `dim`.
+            Note: insecure PRNG is used.
+        """
         e = torch.round(self.stddev * torch.randn(dim, device=self.device))
         e = e.squeeze()
         return e.to(torch.int)
 
     def uniform(self, dim, modulus):
+        """ Generate Gaussian noise of size `dim` mod `modulus`.
+            Note: insecure PRNG is used.
+        """
         return torch.randint(modulus, size=(dim,), dtype=torch.int32).to(self.device)
 
     def negacyclic_fft(self, a):
+        """ Negacyclic FFT on the given tensor a.
+        """
         acomplex = a.to(torch.complex128).to(self.device)
 
         a_precomp = (acomplex[..., :self.Nh] + 1j * acomplex[..., self.Nh:]) * self.root_powers
@@ -112,6 +126,8 @@ class fhew_engine:
         return torch.fft.fft(a_precomp)
 
     def negacyclic_ifft(self, A):
+        """ Negacyclic inverse FFT on the given tensor A.
+        """
         b = torch.fft.ifft(A)
         b *= self.root_powers_inv
 
@@ -125,25 +141,13 @@ class fhew_engine:
 
         return aint
 
-    # make an RLWE encryption of message
-    def encrypt_to_fft(self, m, sfft):
-        ct = torch.stack([self.errgen(self.N), self.uniform(self.N, self.Q)]).to(self.device)
-        ctfft = self.negacyclic_fft(ct)
+    def to_signed(self, v, logQ):
+        """ Convert unsigned tensor to signed tensor mod Q.
 
-        ctfft[0] += -ctfft[1] * sfft + self.negacyclic_fft(m)
-
-        return ctfft
-
-    def encrypt_bit_to_fft(self, b, sfft):
-        ct = torch.stack([self.errgen(self.N), self.uniform(self.N, self.Q)]).to(self.device)
-        ctfft = self.negacyclic_fft(ct)
-
-        ctfft[0] += -ctfft[1] * sfft
-        ctfft[0] += b
-
-        return ctfft
-
-    def normalize(self, v, logQ):
+            Keyword arguments:
+            v -- unsigned tensor to convert
+            logQ -- log_2 of Q, i.e., Q = 1 << logQ
+        """
         # same as follows but no branch
         """
         if v > Q//2:
@@ -157,13 +161,9 @@ class fhew_engine:
         v -= (Q) * msb
         return v
 
-    def decrypt_from_fft(self, ctfft, sfft):
-        assert len(ctfft.size()) == 2
-        # normalization is optional
-        return self.normalize(self.negacyclic_ifft(ctfft[0] + ctfft[1]*sfft), self.logQ)
-        # return negacyclic_ifft(ctfft[0] + ctfft[1]*sfft, N, Q)
-
     def decompose(self, a):
+        """ Unsigned digit (B) decomposition of given tensor a.
+        """
         # currently RGSW is only supported
         return (a.unsqueeze(0) >> self.decomp_shift.view(self.d, 1, 1)) & self.mask
         """
@@ -182,6 +182,9 @@ class fhew_engine:
     # about twice heavier than unsigned decomposition
     # it returns value -B/2 <= * <= B/2, not < B/2, but okay
     def signed_decompose(self, a):
+        """ Signed decomposition of given tensor a.
+            Uses `decompose` two times.
+        """
         # carry
         da = self.decompose(a + (a & self.msbmask))
         # -B
@@ -189,6 +192,7 @@ class fhew_engine:
         return da
 
     def encrypt_rgsw_fft(self, z, skfft):
+        """ Return RGSW_sk(z). """
         # RGSW has a dimension of d, 2, 2, N
         rgsw = torch.zeros(self.d, 2, 2, self.N, dtype=torch.int32, device=self.device)
 
@@ -201,7 +205,7 @@ class fhew_engine:
         rgsw[:, :, 0, :] = torch.round(self.stddev * torch.randn(size = (self.d, 2, self.N))).to(self.device)
 
         # following is equal to rgsw %= Q, but a faster version
-        rgsw = self.normalize(rgsw, self.logQ)
+        rgsw = self.to_signed(rgsw, self.logQ)
 
         # do fft for easy a*s
         rgswfft = self.negacyclic_fft(rgsw)
@@ -215,35 +219,10 @@ class fhew_engine:
         rgswfft[:, 1, 1, :] += gzfft
 
         return rgswfft
-    
-    def encrypt_bit_to_rgsw_fft(self, b, skfft):
-        # RGSW has a dimension of d, 2, 2, N
-        rgsw = torch.zeros(self.d, 2, 2, self.N, dtype=torch.int32).to(self.device)
-
-        # generate the 'a' part
-        # INSECURE: to be fixed later
-        rgsw[:, :, 1, :] = torch.randint(self.Q, size = (self.d, 2 , self.N), dtype= torch.int32)
-
-        # add error on b
-        # INSECURE: to be fixed later
-        rgsw[:, :, 0, :] = torch.round(self.stddev * torch.randn(size = (self.d, 2, self.N)))
-
-        # following is equal to rgsw %= Q, but a faster version
-        rgsw = self.normalize(rgsw, self.logQ)
-
-        # do fft for easy a*s
-        rgswfft = self.negacyclic_fft(rgsw)
-
-        # now b = -a*sk + e
-        rgswfft[:, :, 0, :] -= rgswfft[:, :, 1, :] * skfft.view(1, 1, self.Nh)
-
-        gb = self.gvector * b
-        rgswfft[:, 0, 0, :] += gb
-        rgswfft[:, 1, 1, :] += gb
-
-        return rgswfft
 
     def rgswmult(self, ctfft, rgswfft):
+        """ Multiply ctfft (RLWE) and rgswfft (RGSW) and return an RLWE ciphertext. """
+
         ct = self.negacyclic_ifft(ctfft)
         dct = self.signed_decompose(ct)
         multfft = self.negacyclic_fft(dct).view(self.d, 2, 1, self.Nh) * rgswfft
@@ -251,6 +230,13 @@ class fhew_engine:
         return torch.sum(multfft, dim = (0,1))
     
     def encryptLWE(self, message, sk):
+        """ Encrypt a bit.
+
+        Keyword arguemtns:
+        message -- a bit, 0 or 1
+        sk -- secret key to use
+        """
+
         ct = self.uniform(self.n + 1, self.q)
 
         ct[0] = 0
@@ -262,6 +248,8 @@ class fhew_engine:
         return ct
 
     def decryptLWE(self, ct, sk, ksk=None):
+        """ Decrypt LWE ciphertext. Do key switch if needed. """
+
         if len(ct) > self.n + 1:
             if self.ksk == None and ksk == None:
                 print("Cannot key switch to small key. Provide switching key.")
@@ -281,6 +269,8 @@ class fhew_engine:
         return m_dec.to(torch.int)%4
 
     def extract(self, ctRLWE):
+        """ Extract an LWE ciphertext from ctRLWE, holding its the constant term as plaintext."""
+
         beta = ctRLWE[0][0]
 
         alpha = ctRLWE[1][:]
@@ -289,6 +279,8 @@ class fhew_engine:
         return torch.cat((beta.unsqueeze(0), alpha))
 
     def decompose_ks(self, a):
+        """ Decompose LWE ciphertext for LWE key switching.
+        """
         
         assert len(a.size()) == 1
 
@@ -296,7 +288,10 @@ class fhew_engine:
         return res
 
     # size: (self.dks, Bks, N, n+1)
-    def LWEkskGen(self, sk, skN):    
+    def LWEkskGen(self, sk, skN):
+        """ Generate key switching key from skN to sk.
+        """
+
         ksk = torch.randint(self.Qks, size = (self.dks, self.Bks, self.N, self.n+1), dtype=torch.int32).to(self.device)
         # b <- e
         ksk[..., 0] = torch.round(self.stddev * torch.randn(size = (self.dks, self.Bks, self.N))).to(torch.int32)
@@ -309,6 +304,9 @@ class fhew_engine:
         return ksk
 
     def LWEkeySwitch(self, ctLWE, kskLWE):
+        """ Switch key of ctLWE (dimension N) to a smaller key (dimension n).
+        """
+
         # do decomposition
         alpha = ctLWE[1:]
         dalpha = self.decompose_ks(alpha)
@@ -325,6 +323,9 @@ class fhew_engine:
         return switched
 
     def brkgen(self, sk, skNfft):
+        """ Generate blind rotation keys.
+        """
+
         zero_poly = torch.zeros([self.N], dtype=torch.int32).to(self.device)
 
         one_poly = torch.zeros([self.N], dtype=torch.int32).to(self.device)
@@ -339,10 +340,10 @@ class fhew_engine:
 
         return brk
 
-    """
-    alphapoly[i] = fft(X^i - 1)
-    """
     def precompute_alpha(self):
+        """ Precompute fft(X^i - 1), return alphapoly where alphapoly[i] = fft(X^i - 1).
+        """
+
         alphapoly = torch.zeros(self.q, self.Nh, dtype=torch.complex128, device=self.device)
 
         for i in range(self.q):
@@ -356,10 +357,10 @@ class fhew_engine:
             
         return alphapoly
 
-    """
-    betaapoly[i] = fft(X^i)
-    """
     def precompute_beta(self):
+        """ Precompute fft(X^i), return alphapoly where betaapoly[i] = fft(X^i).
+        """
+
         betapoly = torch.zeros(self.q, self.Nh, dtype=torch.complex128, device=self.device)
 
         for i in range(self.q):
@@ -373,6 +374,9 @@ class fhew_engine:
         return betapoly
 
     def nand_map(self, i):
+        """ Precompute LUT function for NAND gate.
+        """
+
         i += 2 * self.N 
         i %= 2 * self.N
         if 3*(self.q >> 3) <= i < 7*(self.q >> 3): # i \in [3q/8, 7q/8)
@@ -381,6 +385,16 @@ class fhew_engine:
             return self.Q >> 3 
 
     def gate_bootstrapping(self, ct0, ct1, brk, ksk, gate="NAND"):
+        """ Do a gate bootstrapping for given `ct0` and `ct1`.
+        Only NAND is supported currently.
+
+        Keyword arguments:
+        ct0, ct1 -- input ciphertexts
+        bkr -- blind rotation keys to use
+        ksk -- LWE key switching keys to use
+        gate :String -- gate to perform e.g., "NAND". 
+        """
+
         ctsum = ct0 + ct1
 
         # NAND is supported only
@@ -423,17 +437,26 @@ class fhew_engine:
         return accLWE
 
     def setKeySwitchKey(self, ksk):
+        """ Enroll LWE key switching keys to engine for simpler codes.
+        """
+
         self.ksk = ksk
         return self
 
     def setBlindRotationKey(self, brk):
+        """ Enroll blind rotation keys to engine for simpler codes.
+        """
+
         self.brk = brk
         return self
     
     def nand(self, ct0, ct1):
+        """ Do a NAND gate on two input ciphertexts ct0 and ct1
+        """
+
         if self.ksk == None or self.brk == None:
             print("Need to set blind rotation key and key switch key")
-            print("using setBlindRotationKey and setKeySwitchKey.")
+            print("using methods setBlindRotationKey and setKeySwitchKey.")
             return
         
         return self.gate_bootstrapping(ct0, ct1, self.brk, self.ksk)
