@@ -3,6 +3,7 @@ import math
 import jax.numpy as jnp
 import jax.random as random
 import jax
+from jax import jit
 jax.config.update("jax_enable_x64", True)
 
 class fhew_engine:
@@ -330,6 +331,33 @@ class fhew_engine:
             return -(self.Q >> 3)
         else:
             return self.Q >> 3 
+    @staticmethod
+    @jit
+    def _gate_bootstrapping_jit(ctsum, f_nand, betapoly, alphapoly, brk, Q, q, Nhx):
+        ctsum &= (Q - 1)
+
+        acc = jnp.zeros([2, len(f_nand)], dtype=jnp.int32)
+        acc = acc.at[0].set(f_nand)
+        Nh = 512
+        accfft = jnp.fft.fft((acc[..., :Nh] + 1j * acc[..., Nh:]) * jnp.exp((1j * math.pi / len(f_nand)) * jnp.arange(Nh)))
+
+        beta = ctsum[0]
+        accfft *= betapoly[beta]
+
+        alpha = ctsum[1:]
+        for i in range(len(alpha)):
+            ai = alpha[i]
+            accfft = accfft + alphapoly[ai] * fhew_engine._rgswmult_jit(accfft, brk[i], Nh)
+
+        acc = jnp.concatenate((accfft.real, accfft.imag), axis=-1).astype(jnp.int32)
+        acc &= (Q - 1)
+        return acc
+
+    @staticmethod
+    @jit
+    def _rgswmult_jit(accfft, rgswfft, Nh):
+        multfft = jnp.fft.fft(accfft) * rgswfft
+        return jnp.sum(multfft, axis=(0, 1))
 
     def gate_bootstrapping(self, ct0, ct1, brk, ksk, gate="NAND"):
         """ Do a gate bootstrapping for given `ct0` and `ct1`.
@@ -341,35 +369,18 @@ class fhew_engine:
         ksk -- LWE key switching keys to use
         gate :String -- gate to perform e.g., "NAND". 
         """
-
         ctsum = ct0 + ct1
 
         # NAND is supported only
         assert gate == "NAND"
-        
+
         if len(ctsum) > self.n + 1:
             ctsum &= (self.Q - 1)
             ctsum_ms = (ctsum * (self.Qks/self.Q)).astype(jnp.int32)
             ctsum_ks = self.LWEkeySwitch(ctsum_ms, ksk)
             ctsum = (ctsum_ks * (self.q/self.Qks)).astype(jnp.int32)
 
-        ctsum &= (self.q - 1)
-
-        acc = jnp.zeros([2, self.N], dtype=jnp.int32)
-        acc = acc.at[0].set(self.f_nand)
-
-        accfft = self.negacyclic_fft(acc)
-
-        beta = ctsum[0]
-        accfft *= self.betapoly[beta]
-
-        alpha = ctsum[1:]
-        for i in range(self.n):
-            ai = alpha[i]
-            accfft = accfft + self.alphapoly[ai] * self.rgswmult(accfft, brk[i])
-
-        acc = self.negacyclic_ifft(accfft)
-        accLWE = self.extract(acc)
+        accLWE = self._gate_bootstrapping_jit(ctsum, self.f_nand, self.betapoly, self.alphapoly, brk, self.Q, self.q, self.Nh)
         accLWE = accLWE.at[0].add(self.Q >> 3)
         accLWE &= (self.Q - 1)
         
